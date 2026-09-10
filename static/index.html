@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Fresh Openings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="board">
+
+  <header class="masthead">
+    <h1>Fresh Openings</h1>
+    <p class="tagline">Pick a role, we search live company career pages and ATS boards for postings that are actually still open — no recruiter reposts, no dead links.</p>
+  </header>
+
+  <form class="control-bar" id="search-form">
+    <div class="field">
+      <label for="category">Role</label>
+      <select id="category" name="category">
+        <option value="">Loading roles…</option>
+      </select>
+    </div>
+
+    <div class="field field-custom" id="custom-field" hidden>
+      <label for="custom-keyword">Keyword</label>
+      <input type="text" id="custom-keyword" placeholder="e.g. embedded systems" />
+    </div>
+
+    <div class="field field-wide">
+      <label for="companies">Companies <span class="hint">(comma-separated, optional)</span></label>
+      <input type="text" id="companies" placeholder="Defaults to a sample list of 10 companies" />
+    </div>
+
+    <button type="submit" id="search-btn">Search</button>
+  </form>
+
+  <p class="status-line" id="status-line" aria-live="polite"></p>
+
+  <section class="feed" id="feed"></section>
+
+  <footer class="disclaimer" id="disclaimer" hidden></footer>
+
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
