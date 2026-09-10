@@ -18,25 +18,25 @@
   </header>
 
   <form class="control-bar" id="search-form">
+    <div class="field field-full">
+      <label for="keywords">Skills / keywords</label>
+      <input
+        type="text"
+        id="keywords"
+        placeholder="e.g. selenium, functional testing, automation, playwright"
+        autocomplete="off"
+      />
+    </div>
+
     <div class="field">
-      <label for="category">Role</label>
-      <select id="category" name="category">
-        <option value="">Loading roles…</option>
-      </select>
-    </div>
-
-    <div class="field field-custom" id="custom-field" hidden>
-      <label for="custom-keyword">Keyword</label>
-      <input type="text" id="custom-keyword" placeholder="e.g. embedded systems" />
-    </div>
-
-    <div class="field field-wide">
       <label for="companies">Companies <span class="hint">(comma-separated, optional)</span></label>
       <input type="text" id="companies" placeholder="Defaults to a sample list of 10 companies" />
     </div>
 
     <button type="submit" id="search-btn">Search</button>
   </form>
+
+  <div class="quick-picks" id="quick-picks" aria-label="Suggested searches"></div>
 
   <p class="status-line" id="status-line" aria-live="polite"></p>
 

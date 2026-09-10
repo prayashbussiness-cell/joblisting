@@ -1,32 +1,32 @@
-const categorySelect = document.getElementById("category");
-const customField = document.getElementById("custom-field");
-const customKeyword = document.getElementById("custom-keyword");
+const keywordsInput = document.getElementById("keywords");
 const companiesInput = document.getElementById("companies");
+const quickPicksEl = document.getElementById("quick-picks");
 const form = document.getElementById("search-form");
 const searchBtn = document.getElementById("search-btn");
 const statusLine = document.getElementById("status-line");
 const feed = document.getElementById("feed");
 const disclaimerEl = document.getElementById("disclaimer");
 
-async function loadCategories() {
+async function loadQuickPicks() {
   try {
-    const res = await fetch("/categories");
+    const res = await fetch("/quick-picks");
     const data = await res.json();
-    categorySelect.innerHTML = "";
-    for (const { id, label } of data.categories) {
-      const opt = document.createElement("option");
-      opt.value = id;
-      opt.textContent = label;
-      categorySelect.appendChild(opt);
+    quickPicksEl.innerHTML = "";
+    for (const pick of data.quick_picks) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "quick-pick";
+      btn.textContent = pick;
+      btn.addEventListener("click", () => {
+        keywordsInput.value = pick;
+        keywordsInput.focus();
+      });
+      quickPicksEl.appendChild(btn);
     }
   } catch (err) {
-    categorySelect.innerHTML = '<option value="">Could not load roles</option>';
+    // Quick-picks are a convenience only — fail silently if unavailable.
   }
 }
-
-categorySelect.addEventListener("change", () => {
-  customField.hidden = categorySelect.value !== "custom";
-});
 
 function escapeHtml(str) {
   const div = document.createElement("div");
@@ -117,12 +117,14 @@ function renderListing(listing) {
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
 
-  const category = categorySelect.value;
-  if (!category) return;
+  const keywords = keywordsInput.value.trim();
+  if (!keywords) {
+    keywordsInput.focus();
+    return;
+  }
 
   const payload = {
-    category,
-    custom_keyword: category === "custom" ? customKeyword.value.trim() : "",
+    keywords,
     companies: companiesInput.value
       .split(",")
       .map((c) => c.trim())
@@ -153,7 +155,7 @@ form.addEventListener("submit", async (e) => {
 
     statusLine.textContent = `Searched ${data.companies_searched.join(
       ", "
-    )} for "${data.category_label}" — found ${jobCount} posting${
+    )} for "${data.query}" — found ${jobCount} posting${
       jobCount === 1 ? "" : "s"
     } (${data.latency_ms}ms)`;
 
@@ -172,4 +174,4 @@ form.addEventListener("submit", async (e) => {
   }
 });
 
-loadCategories();
+loadQuickPicks();

@@ -42,7 +42,7 @@ from google.genai import types as genai_types
 try:
     # Works when run from inside backend/ (uvicorn main:app)
     from prompt import (
-        CATEGORY_LABELS,
+        QUICK_PICKS,
         DEFAULT_COMPANIES,
         MAX_COMPANIES,
         RESEARCH_DISCLAIMER,
@@ -54,7 +54,7 @@ try:
 except ImportError:
     # Works when run from the repo root (uvicorn backend.main:app)
     from backend.prompt import (
-        CATEGORY_LABELS,
+        QUICK_PICKS,
         DEFAULT_COMPANIES,
         MAX_COMPANIES,
         RESEARCH_DISCLAIMER,
@@ -75,7 +75,7 @@ BASE_DIR = os.path.dirname(__file__)
 
 # --- Gemini config ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_SEARCH_MODEL = os.environ.get("GEMINI_SEARCH_MODEL", GEMINI_MODEL)
 
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
@@ -121,8 +121,9 @@ else:
 # ---------------------------------------------------------------------------
 
 class SearchRequest(BaseModel):
-    category: str = Field(..., description="Category id from CATEGORY_LABELS, or 'custom'")
-    custom_keyword: str = Field("", description="Used when category == 'custom'")
+    keywords: str = Field(
+        ..., description="Free-text role/skills query, e.g. 'selenium, functional, automation, playwright'"
+    )
     companies: list[str] = Field(
         default_factory=list,
         description="Optional list of companies to search. Defaults to DEFAULT_COMPANIES.",
@@ -143,16 +144,11 @@ def _extract_json(raw_text: str) -> dict:
     return json.loads(text)
 
 
-def _resolve_category_label(payload: SearchRequest) -> str:
-    if payload.category == "custom":
-        keyword = payload.custom_keyword.strip()
-        if not keyword:
-            raise HTTPException(status_code=422, detail="custom_keyword is required when category is 'custom'.")
-        return keyword
-    label = CATEGORY_LABELS.get(payload.category)
-    if not label:
-        raise HTTPException(status_code=422, detail=f"Unknown category '{payload.category}'.")
-    return label
+def _resolve_query(payload: SearchRequest) -> str:
+    query = payload.keywords.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="keywords is required, e.g. 'selenium, automation, playwright'.")
+    return query
 
 
 def _resolve_companies(payload: SearchRequest) -> list[str]:
@@ -170,7 +166,7 @@ def _resolve_companies(payload: SearchRequest) -> list[str]:
     return cleaned[:MAX_COMPANIES]
 
 
-async def fetch_grounded_jobs(category_label: str, companies: list[str]) -> str:
+async def fetch_grounded_jobs(query: str, companies: list[str]) -> str:
     """
     Step 1: a SEPARATE Gemini call with Google Search grounding enabled.
     This is the only step allowed to produce facts (company names, titles,
@@ -184,7 +180,7 @@ async def fetch_grounded_jobs(category_label: str, companies: list[str]) -> str:
     try:
         response = gemini_client.models.generate_content(
             model=GEMINI_SEARCH_MODEL,
-            contents=[build_grounded_search_prompt(category_label, companies)],
+            contents=[build_grounded_search_prompt(query, companies)],
             config=genai_types.GenerateContentConfig(
                 system_instruction=GROUNDED_SEARCH_SYSTEM_PROMPT,
                 max_output_tokens=3500,
@@ -203,7 +199,7 @@ async def fetch_grounded_jobs(category_label: str, companies: list[str]) -> str:
         )
 
 
-async def generate_job_listing(category_label: str, companies: list[str]) -> dict:
+async def generate_job_listing(query: str, companies: list[str]) -> dict:
     """Runs both steps and returns the parsed structured listing dict."""
     if gemini_client is None:
         raise RuntimeError(
@@ -212,11 +208,11 @@ async def generate_job_listing(category_label: str, companies: list[str]) -> dic
         )
 
     # Step 1: real, current postings via Google Search grounding.
-    grounded_context = await fetch_grounded_jobs(category_label, companies)
+    grounded_context = await fetch_grounded_jobs(query, companies)
 
     # Step 2: structuring call, informed by (and restricted to) that context.
     user_prompt = build_user_prompt(
-        category_label=category_label, companies=companies, grounded_context=grounded_context
+        query=query, companies=companies, grounded_context=grounded_context
     )
 
     response = gemini_client.models.generate_content(
@@ -255,27 +251,28 @@ async def health():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-@app.get("/categories")
-async def categories():
-    """Lets the frontend build its dropdown from the same source of truth
-    the backend uses, instead of hardcoding the list twice."""
-    return {"categories": [{"id": cid, "label": label} for cid, label in CATEGORY_LABELS.items()]}
+@app.get("/quick-picks")
+async def quick_picks():
+    """Lets the frontend build its suggestion chips from the same source of
+    truth the backend uses, instead of hardcoding the list twice. These are
+    suggestions only — the user can type any free-text query."""
+    return {"quick_picks": QUICK_PICKS, "default_companies": DEFAULT_COMPANIES}
 
 
 @app.post("/search")
 async def search(payload: SearchRequest):
     """
-    Main endpoint: accepts a category (+ optional custom keyword) and an
-    optional company list, runs the grounded search + structuring pipeline,
-    and returns the job listing JSON.
+    Main endpoint: accepts a free-text role/skills query (e.g. "selenium,
+    functional, automation, playwright") and an optional company list, runs
+    the grounded search + structuring pipeline, and returns the listing.
     """
-    category_label = _resolve_category_label(payload)
+    query = _resolve_query(payload)
     companies = _resolve_companies(payload)
 
     start = time.monotonic()
 
     try:
-        listing = await generate_job_listing(category_label, companies)
+        listing = await generate_job_listing(query, companies)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception:
@@ -290,7 +287,7 @@ async def search(payload: SearchRequest):
     return JSONResponse(
         {
             "success": True,
-            "category_label": category_label,
+            "query": query,
             "companies_searched": companies,
             "listing": listing,
             "latency_ms": latency_ms,

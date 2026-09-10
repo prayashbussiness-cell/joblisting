@@ -26,19 +26,18 @@ page, because the model can still misread a stale search snippet. Treat
 this as a demo/POC, not a production data pipeline — see README.md.
 """
 
-# (id, display_label) — the category presets shown in the frontend dropdown.
-# "custom" lets the user type any keyword instead (e.g. "embedded systems").
-CATEGORIES = [
-    ("testing", "Software Testing / QA"),
-    ("software_dev", "Software Development"),
-    ("data", "Data / Analytics"),
-    ("devops", "DevOps / Cloud / SRE"),
-    ("support", "Technical / IT Support"),
-    ("design", "UI/UX Design"),
-    ("product", "Product Management"),
-    ("custom", "Custom keyword"),
+# Quick-pick suggestions shown as clickable chips in the frontend — clicking
+# one fills the free-text keyword box, it doesn't lock the user into a fixed
+# list. The user can type anything, including multiple comma-separated
+# skills (e.g. "selenium, functional testing, automation, playwright").
+QUICK_PICKS = [
+    "Selenium, Functional Testing, Automation, Playwright",
+    "Manual Testing, QA, Test Cases",
+    "Software Development, Java, Python",
+    "Data Analyst, SQL, Power BI",
+    "DevOps, AWS, Kubernetes, CI/CD",
+    "UI/UX Design, Figma",
 ]
-CATEGORY_LABELS = {cid: label for cid, label in CATEGORIES}
 
 # A starter list of companies to search across when the user doesn't supply
 # their own. Deliberately mixes a couple of ATS-friendly companies with the
@@ -72,9 +71,17 @@ RESEARCH_DISCLAIMER = (
 # ---------------------------------------------------------------------------
 
 GROUNDED_SEARCH_SYSTEM_PROMPT = """You are a job-search research assistant
-with live web search access. Given a job category/role keyword and a list
-of target companies, search for CURRENT, OPEN job postings matching that
-role at those companies.
+with live web search access. Given a role/skills query and a list of target
+companies, search for CURRENT, OPEN job postings matching that query at
+those companies.
+
+The query may be a single role title (e.g. "Software Testing / QA") OR a
+comma-separated list of specific skills/tools (e.g. "selenium, functional
+testing, automation, playwright"). When it's a skills list, treat it as
+one combined profile — search for postings whose title or description
+mentions ANY of those skills/tools, not only ones that mention all of them,
+and prefer postings that match more of the listed skills over ones that
+match only one.
 
 Prioritize, in this order:
 1. The company's own official careers page or ATS-hosted board (Greenhouse,
@@ -104,13 +111,13 @@ step, not a final answer. Organize your findings company by company.
 """
 
 
-def build_grounded_search_prompt(category_label: str, companies: list[str]) -> str:
+def build_grounded_search_prompt(query: str, companies: list[str]) -> str:
     company_list = ", ".join(companies)
     return (
-        f"Search for current open job postings for the role/category "
-        f'"{category_label}" at each of these companies: {company_list}.\n\n'
-        f"For each company, find as many genuinely open postings in this "
-        f"category as you can (aim for up to 3 per company), following the "
+        f"Search for current open job postings matching this role/skills "
+        f'query: "{query}", at each of these companies: {company_list}.\n\n'
+        f"For each company, find as many genuinely open postings matching "
+        f"the query as you can (aim for up to 3 per company), following the "
         f"source priority and reporting format in your instructions."
     )
 
@@ -159,7 +166,7 @@ Do not editorialize about company quality or add recommendations — this is
 a factual listing tool, not an advisory one.
 """
 
-USER_PROMPT_TEMPLATE = """CATEGORY REQUESTED: {category_label}
+USER_PROMPT_TEMPLATE = """QUERY REQUESTED: {query}
 COMPANIES SEARCHED: {companies}
 
 GROUNDED_CONTEXT (from a real web search performed just now — this is your
@@ -168,13 +175,14 @@ ONLY source of facts; do not add anything not present here):
 {grounded_context}
 ---
 
-Reformat the above into the required JSON object now. Return JSON only.
+Reformat the above into the required JSON object now. Set "category_label"
+to the query as given. Return JSON only.
 """
 
 
-def build_user_prompt(category_label: str, companies: list[str], grounded_context: str) -> str:
+def build_user_prompt(query: str, companies: list[str], grounded_context: str) -> str:
     return USER_PROMPT_TEMPLATE.format(
-        category_label=category_label,
+        query=query,
         companies=", ".join(companies),
         grounded_context=grounded_context or "No grounded context was retrieved for this request.",
     )
