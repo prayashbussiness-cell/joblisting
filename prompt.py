@@ -134,6 +134,7 @@ is cleaning, classifying, and structuring what's already there.
 
 If GROUNDED_CONTEXT says no postings were found for a company, do not
 include a row for that company — instead note it in "companies_with_no_results".
+
 If GROUNDED_CONTEXT is empty, unavailable, or an error message, return an
 empty "jobs" array and explain why in "notes" — never invent postings to
 fill the response.

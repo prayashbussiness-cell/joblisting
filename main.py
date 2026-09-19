@@ -36,6 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
 from google import genai
 from google.genai import types as genai_types
 
@@ -75,7 +76,12 @@ BASE_DIR = os.path.dirname(__file__)
 
 # --- Gemini config ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# FIX: the previous default here was "gemini-3.6-flash", which is not a
+# real Gemini model name. That caused every generate_content() call to
+# fail (model not found) whenever GEMINI_MODEL wasn't explicitly set in
+# the environment, which in turn made fetch_grounded_jobs() silently fall
+# back to its "search unavailable" string. Use a real, current model.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_SEARCH_MODEL = os.environ.get("GEMINI_SEARCH_MODEL", GEMINI_MODEL)
 
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
@@ -155,6 +161,7 @@ def _resolve_companies(payload: SearchRequest) -> list[str]:
     companies = [c.strip() for c in payload.companies if c.strip()]
     if not companies:
         companies = list(DEFAULT_COMPANIES)
+
     # de-duplicate while preserving order
     seen = set()
     cleaned = []
@@ -270,7 +277,6 @@ async def search(payload: SearchRequest):
     companies = _resolve_companies(payload)
 
     start = time.monotonic()
-
     try:
         listing = await generate_job_listing(query, companies)
     except RuntimeError as exc:
@@ -281,7 +287,6 @@ async def search(payload: SearchRequest):
             status_code=502,
             detail="Something went wrong while searching for openings. Please try again.",
         )
-
     latency_ms = int((time.monotonic() - start) * 1000)
 
     return JSONResponse(
