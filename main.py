@@ -21,6 +21,23 @@ Honest limitation: this is a demo/POC. Google Search grounding is a fast
 way to prototype "find me fresh jobs," but it's less reliable than pulling
 directly from each company's own ATS API or career page (see the
 discussion in README.md). Don't treat this as a production data pipeline.
+
+Quota note (read this if /search keeps returning "no postings"):
+Grounding with Google Search has its OWN quota on the Gemini API, separate
+from (and much smaller than) the normal plain-text generation quota. A
+free/low-tier key can exhaust the grounding quota after a handful of
+searches even though ordinary (non-grounded) generate_content calls keep
+working fine. That's a real account/billing limit, not something any
+client-side code change can bypass — check https://ai.dev/usage and
+https://ai.google.dev/gemini-api/docs/rate-limits for your key's current
+grounding quota. What this file DOES do to cope with that:
+  1. Retries a 429 on the grounded call a couple of times with backoff,
+     which helps with short per-minute limits.
+  2. Surfaces a specific "grounding quota exceeded" message instead of a
+     generic "search tool error", so it's obvious what's going on.
+  3. Caches identical (query, companies) searches in memory for a few
+     minutes, so repeated testing/clicking doesn't burn quota you don't
+     have to spend.
 """
 
 import os
@@ -39,6 +56,7 @@ from pydantic import BaseModel, Field
 
 from google import genai
 from google.genai import types as genai_types
+from google.genai import errors as genai_errors
 
 try:
     # Works when run from inside backend/ (uvicorn main:app)
@@ -76,13 +94,24 @@ BASE_DIR = os.path.dirname(__file__)
 
 # --- Gemini config ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# FIX: the previous default here was "gemini-3.6-flash", which is not a
-# real Gemini model name. That caused every generate_content() call to
-# fail (model not found) whenever GEMINI_MODEL wasn't explicitly set in
-# the environment, which in turn made fetch_grounded_jobs() silently fall
-# back to its "search unavailable" string. Use a real, current model.
+# "gemini-3.6-flash" is not a real model name — use a real, current one.
+# NOTE: if GEMINI_MODEL / GEMINI_SEARCH_MODEL are set as Render environment
+# variables, those override this default entirely. Check your Render
+# service's Environment tab if you still see an unexpected model in logs.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_SEARCH_MODEL = os.environ.get("GEMINI_SEARCH_MODEL", GEMINI_MODEL)
+
+# How many times to retry the grounded search call if Gemini returns a 429,
+# and how long to wait between attempts (seconds). Short/cheap by design —
+# this is meant to smooth over brief per-minute rate limits, not to wait out
+# a fully exhausted daily/monthly grounding quota.
+GROUNDING_RETRY_ATTEMPTS = int(os.environ.get("GROUNDING_RETRY_ATTEMPTS", "2"))
+GROUNDING_RETRY_DELAY_SECONDS = float(os.environ.get("GROUNDING_RETRY_DELAY_SECONDS", "3"))
+
+# How long to reuse a previous grounded search result for the same
+# (query, companies) pair, to avoid re-spending grounding quota on repeat
+# testing. Set to 0 to disable caching.
+GROUNDING_CACHE_TTL_SECONDS = int(os.environ.get("GROUNDING_CACHE_TTL_SECONDS", "300"))
 
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 origins = (
@@ -120,6 +149,10 @@ if GEMINI_API_KEY:
         logger.exception("Failed to initialize Gemini client — check GEMINI_API_KEY.")
 else:
     logger.warning("GEMINI_API_KEY not set — job search will fail until it's configured.")
+
+# Very small in-memory cache: {(query_lower, tuple(sorted companies)): (expires_at, text)}
+# Process-local only (fine for a single free Render instance / demo use).
+_grounded_cache: dict[tuple, tuple[float, str]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -173,37 +206,95 @@ def _resolve_companies(payload: SearchRequest) -> list[str]:
     return cleaned[:MAX_COMPANIES]
 
 
+def _is_quota_exhausted_error(exc: Exception) -> bool:
+    """True for a 429 RESOURCE_EXHAUSTED from the Gemini API specifically."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    # Fall back to string sniffing in case the SDK version doesn't expose
+    # status_code on this exception type.
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "429" in text
+
+
+def _cache_key(query: str, companies: list[str]) -> tuple:
+    return (query.strip().lower(), tuple(sorted(c.lower() for c in companies)))
+
+
 async def fetch_grounded_jobs(query: str, companies: list[str]) -> str:
     """
     Step 1: a SEPARATE Gemini call with Google Search grounding enabled.
     This is the only step allowed to produce facts (company names, titles,
-    links, dates). Best-effort: if grounding fails, returns a clear
-    fallback string so the structuring step reports the failure honestly
-    instead of the caller crashing.
+    links, dates).
+
+    Grounding has its own, much smaller quota than plain generate_content
+    calls — a 429 here does NOT mean the API key or the rest of the app is
+    broken; it means the grounding-specific quota is temporarily or fully
+    exhausted. See the module docstring for details.
     """
     if gemini_client is None:
         return "Live search unavailable: Gemini is not configured."
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_SEARCH_MODEL,
-            contents=[build_grounded_search_prompt(query, companies)],
-            config=genai_types.GenerateContentConfig(
-                system_instruction=GROUNDED_SEARCH_SYSTEM_PROMPT,
-                max_output_tokens=3500,
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-            ),
-        )
-        text = (response.text or "").strip()
-        if not text:
-            return "Live search returned no results for this category/company list."
-        return text
-    except Exception:
-        logger.exception("Grounded search (Google Search tool) failed")
+    cache_key = _cache_key(query, companies)
+    if GROUNDING_CACHE_TTL_SECONDS > 0:
+        cached = _grounded_cache.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            logger.info("Serving grounded search from cache for %s", cache_key)
+            return cached[1]
+
+    last_error: Exception | None = None
+    for attempt in range(1, GROUNDING_RETRY_ATTEMPTS + 2):  # +1 initial try, +N retries
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_SEARCH_MODEL,
+                contents=[build_grounded_search_prompt(query, companies)],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=GROUNDED_SEARCH_SYSTEM_PROMPT,
+                    max_output_tokens=3500,
+                    tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+                ),
+            )
+            text = (response.text or "").strip()
+            if not text:
+                return "Live search returned no results for this category/company list."
+
+            if GROUNDING_CACHE_TTL_SECONDS > 0:
+                _grounded_cache[cache_key] = (
+                    time.monotonic() + GROUNDING_CACHE_TTL_SECONDS,
+                    text,
+                )
+            return text
+
+        except genai_errors.ClientError as exc:
+            last_error = exc
+            if _is_quota_exhausted_error(exc) and attempt <= GROUNDING_RETRY_ATTEMPTS:
+                logger.warning(
+                    "Grounded search hit 429 (attempt %s/%s), retrying in %ss",
+                    attempt, GROUNDING_RETRY_ATTEMPTS + 1, GROUNDING_RETRY_DELAY_SECONDS,
+                )
+                time.sleep(GROUNDING_RETRY_DELAY_SECONDS)
+                continue
+            break
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, this is a best-effort step
+            last_error = exc
+            break
+
+    if last_error is not None and _is_quota_exhausted_error(last_error):
+        logger.error("Grounded search (Google Search tool) quota exhausted: %s", last_error)
         return (
-            "Live search was unavailable for this request (search tool error). "
-            "No postings could be verified."
+            "Live search is temporarily unavailable: the Google Search grounding "
+            "quota for this Gemini API key has been used up (this is a separate, "
+            "smaller quota than normal text generation). It will reset on Google's "
+            "usual schedule, or you can raise it by enabling billing on the "
+            "project — see https://ai.google.dev/gemini-api/docs/rate-limits. "
+            "No postings could be verified this time."
         )
+
+    logger.exception("Grounded search (Google Search tool) failed", exc_info=last_error)
+    return (
+        "Live search was unavailable for this request (search tool error). "
+        "No postings could be verified."
+    )
 
 
 async def generate_job_listing(query: str, companies: list[str]) -> dict:
@@ -218,6 +309,8 @@ async def generate_job_listing(query: str, companies: list[str]) -> dict:
     grounded_context = await fetch_grounded_jobs(query, companies)
 
     # Step 2: structuring call, informed by (and restricted to) that context.
+    # No tools attached here, so this call is NOT subject to the grounding
+    # quota — it uses the ordinary, much larger plain-text quota.
     user_prompt = build_user_prompt(
         query=query, companies=companies, grounded_context=grounded_context
     )
