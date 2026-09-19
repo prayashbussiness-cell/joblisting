@@ -2,28 +2,34 @@
 prompt.py
 
 Holds the prompt templates + fixed category/seed-company config used to pull
-fresh job openings for a given category (e.g. "Testing") via Gemini, using
-the same two-step pattern as the stock research terminal this project is
-modeled on:
+fresh job openings for a given category (e.g. "Testing").
 
-Design notes (mirrors the reference project's approach):
-- Step 1 is a SEPARATE Gemini call with Google Search grounding enabled.
-  It does the actual "go find current job postings" work. This is the ONLY
-  step allowed to produce facts — company names, job titles, links, dates.
-- Step 2 takes that raw grounded text and reshapes it into strict JSON so
-  the frontend can render a clean list. Step 2 is explicitly forbidden from
-  inventing or adding any posting that wasn't in the Step 1 output — its
-  job is formatting/classification, not sourcing.
-- This mirrors why the reference project splits mutual-fund/news data (must
-  be grounded) from the rest of the report (can use model knowledge): here,
-  ALL of the output must be grounded, since a job listing is worthless if
-  it's not real.
+ARCHITECTURE CHANGE (see main.py docstring for the full story): fact-finding
+is no longer done by Gemini's Google Search grounding tool. That tool has
+its own separate, much smaller quota on the Gemini API than plain text
+generation, and it was getting exhausted independently of everything else
+working fine. Instead:
 
-Honest limitation (see README): Google Search grounding is a fast way to
-prototype this, but it is inherently less reliable than pulling directly
-from each company's official ATS API (Greenhouse/Lever/etc.) or career
-page, because the model can still misread a stale search snippet. Treat
-this as a demo/POC, not a production data pipeline — see README.md.
+- Step 1 (in main.py) calls a real web search API (Serper.dev, wrapping
+  Google Search) directly, once per target company, restricted to results
+  from roughly the last 24 hours. This is the ONLY step allowed to produce
+  facts — company names, job titles, links, dates — and every link it
+  produces is a real URL that came back from the search engine, not
+  something a model wrote.
+- Step 2 (this file's SYSTEM_PROMPT) takes those raw search snippets and
+  reshapes them into strict JSON so the frontend can render a clean list.
+  It is explicitly forbidden from inventing or modifying a posting, link,
+  or detail that wasn't in the search results — its job is formatting and
+  classification only, same as before. Because this step has no tools
+  attached, it only uses Gemini's ordinary text-generation quota, not the
+  grounding quota — that's what makes it reliable.
+
+Honest limitation: filtering to "posted in roughly the last 24 hours" is a
+Google-search date filter (`tbs=qdr:d`), which depends on Google having
+indexed a fresh crawl date for the page — it is a best-effort recency
+signal, not a guarantee down to the hour. Some companies simply won't have
+posted anything new in the last 24h, and that's an honest "no results"
+rather than a bug. See README.md for more on this project's limitations.
 """
 
 # Quick-pick suggestions shown as clickable chips in the frontend — clicking
@@ -60,84 +66,57 @@ DEFAULT_COMPANIES = [
 MAX_COMPANIES = 12
 
 RESEARCH_DISCLAIMER = (
-    "Listings are pulled via AI web search and may be incomplete, delayed, "
-    "or occasionally inaccurate. Always verify on the company's own career "
+    "Listings are pulled via live web search and may be incomplete or "
+    "occasionally out of date. Always verify on the company's own career "
     "page before applying."
 )
 
 # ---------------------------------------------------------------------------
-# Step 1: web-search-grounded prompt (separate call, Google Search tool)
-# This is the ONLY step that may introduce facts.
+# Step 1: real web search query construction (Serper.dev / Google Search)
+# This is the ONLY step that may introduce facts — see main.py's
+# fetch_web_search_context(), which calls the search API with these queries.
 # ---------------------------------------------------------------------------
 
-GROUNDED_SEARCH_SYSTEM_PROMPT = """You are a job-search research assistant
-with live web search access. Given a role/skills query and a list of target
-companies, search for CURRENT, OPEN job postings matching that query at
-those companies.
-
-The query may be a single role title (e.g. "Software Testing / QA") OR a
-comma-separated list of specific skills/tools (e.g. "selenium, functional
-testing, automation, playwright"). When it's a skills list, treat it as
-one combined profile — search for postings whose title or description
-mentions ANY of those skills/tools, not only ones that mention all of them,
-and prefer postings that match more of the listed skills over ones that
-match only one.
-
-Prioritize, in this order:
-1. The company's own official careers page or ATS-hosted board (Greenhouse,
-   Lever, Ashby, Workday, SmartRecruiters, or the company's own
-   careers.[company].com domain).
-2. The company's official LinkedIn Jobs listing for that specific posting.
-3. Reputable listings only as a last resort — and if you use one, say so.
-
-For EACH posting you find, report:
-- Company name
-- Exact job title
-- Location (city/remote)
-- Experience level if stated (e.g. Fresher, 0-2 yrs, 3-5 yrs, Senior)
-- Posted date or "time ago" if the source shows one, else say "not shown"
-- The DIRECT application URL (the actual posting page, not a homepage)
-- Which source it came from (company career page / company ATS board /
-  LinkedIn / other — name the actual source)
-
-Do not invent, guess, or fill in a posting you are not reasonably confident
-is currently live. If you find NO current postings for a company in this
-category, say so explicitly for that company rather than fabricating one.
-If a company's career site could not be searched (blocked, no results,
-etc.), say so plainly.
-
-Be concise and factual — this is raw research material for a formatting
-step, not a final answer. Organize your findings company by company.
-"""
-
-
-def build_grounded_search_prompt(query: str, companies: list[str]) -> str:
-    company_list = ", ".join(companies)
-    return (
-        f"Search for current open job postings matching this role/skills "
-        f'query: "{query}", at each of these companies: {company_list}.\n\n'
-        f"For each company, find as many genuinely open postings matching "
-        f"the query as you can (aim for up to 3 per company), following the "
-        f"source priority and reporting format in your instructions."
-    )
+def build_company_search_query(query: str, company: str) -> str:
+    """
+    Builds the literal search-engine query string for one company. Kept
+    simple and literal on purpose — the search engine's own ranking does
+    the heavy lifting, and Step 2 is told to discard anything irrelevant.
+    """
+    return f'{company} "{query}" jobs hiring'
 
 
 # ---------------------------------------------------------------------------
 # Step 2: structuring prompt (strict JSON, no tools, no new facts)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You reformat raw job-search research notes into strict
-JSON for a frontend to render. You do NOT have web access and you must NOT
+SYSTEM_PROMPT = """You reformat raw web search results into strict JSON for
+a frontend to render. You do NOT have web access yourself and you must NOT
 add, guess, or "fill in" any posting, company, link, or detail that is not
-already present in the GROUNDED_CONTEXT you are given below. Your only job
-is cleaning, classifying, and structuring what's already there.
+already present in the SEARCH_RESULTS you are given below. Your only job is
+cleaning, classifying, and structuring what's already there.
 
-If GROUNDED_CONTEXT says no postings were found for a company, do not
-include a row for that company — instead note it in "companies_with_no_results".
+CRITICAL RULE ON LINKS: every "apply_url" you output MUST be copied
+character-for-character from a "link" field in SEARCH_RESULTS. Never
+shorten, guess, autocomplete, or construct a URL yourself. If you cannot
+find a genuine job-posting link for something, leave it out entirely rather
+than inventing one.
 
-If GROUNDED_CONTEXT is empty, unavailable, or an error message, return an
-empty "jobs" array and explain why in "notes" — never invent postings to
-fill the response.
+Each result in SEARCH_RESULTS includes the company it was searched for, a
+title, a link, a snippet, and (when available) a date. Only include a
+posting if the title/snippet clearly indicates it is an actual open job
+posting (not a company homepage, a "life at X" blog post, a news article
+about layoffs, or an unrelated search result). Skip anything that isn't
+clearly a job posting.
+
+If SEARCH_RESULTS has no usable postings for a company, do not include a
+row for that company — instead note it in "companies_with_no_results". This
+is common and expected when a company simply hasn't posted anything new in
+the search window — do not treat it as an error.
+
+If SEARCH_RESULTS is empty, unavailable, or an error message for every
+company, return an empty "jobs" array and explain why in "notes" — never
+invent postings to fill the response.
 
 Respond with STRICT JSON ONLY — no markdown code fences, no commentary
 before or after, no trailing commas. The JSON must be a single object of
@@ -145,22 +124,22 @@ this exact shape:
 
 {
   "category_label": "string, the human-readable category/role searched",
-  "generated_at_note": "string, e.g. 'Live search results' or a short note on data recency/limitations",
+  "generated_at_note": "string, e.g. 'Live search results (last ~24h)' or a short note on data recency/limitations",
   "jobs": [
     {
       "company": "string",
       "title": "string, exact job title as found",
       "location": "string, e.g. 'Bengaluru' or 'Remote (India)' or 'Not specified'",
       "experience_level": "string, e.g. 'Fresher', '0-2 yrs', '3-5 yrs', 'Not specified'",
-      "posted": "string, e.g. '2 days ago', '2026-09-05', or 'Not specified'",
-      "apply_url": "string, the direct posting URL from the research notes",
-      "source": "string, e.g. 'Company career page', 'Greenhouse board', 'LinkedIn Jobs'",
-      "is_direct_apply": true or false — true only if apply_url points to the company's own domain or an ATS board (Greenhouse/Lever/Ashby/Workday/SmartRecruiters/etc.), false if it's a general aggregator or you're unsure,
-      "summary": "string, one short line on the role, only if the research notes support it, else empty string"
+      "posted": "string, the date field from the search result if present, else 'Not specified'",
+      "apply_url": "string, copied verbatim from a 'link' field in SEARCH_RESULTS",
+      "source": "string, e.g. 'Company career page', 'Greenhouse board', 'LinkedIn Jobs', or the domain of the link",
+      "is_direct_apply": true or false — true only if apply_url points to the company's own domain or an ATS board (Greenhouse/Lever/Ashby/Workday/SmartRecruiters/Naukri/etc.), false if it's a general aggregator or you're unsure,
+      "summary": "string, one short line on the role, only if the snippet supports it, else empty string"
     }
   ],
   "companies_with_no_results": ["string", "..."],
-  "notes": "string, any caveats worth surfacing to the user (e.g. 'search was limited for X', 'no postings found in this category right now')"
+  "notes": "string, any caveats worth surfacing to the user (e.g. 'no postings found in the last 24h for X', 'search was limited for Y')"
 }
 
 Do not editorialize about company quality or add recommendations — this is
@@ -170,10 +149,10 @@ a factual listing tool, not an advisory one.
 USER_PROMPT_TEMPLATE = """QUERY REQUESTED: {query}
 COMPANIES SEARCHED: {companies}
 
-GROUNDED_CONTEXT (from a real web search performed just now — this is your
-ONLY source of facts; do not add anything not present here):
+SEARCH_RESULTS (from a real web search performed just now — this is your
+ONLY source of facts and links; do not add anything not present here):
 ---
-{grounded_context}
+{search_context}
 ---
 
 Reformat the above into the required JSON object now. Set "category_label"
@@ -181,9 +160,9 @@ to the query as given. Return JSON only.
 """
 
 
-def build_user_prompt(query: str, companies: list[str], grounded_context: str) -> str:
+def build_user_prompt(query: str, companies: list[str], search_context: str) -> str:
     return USER_PROMPT_TEMPLATE.format(
         query=query,
         companies=", ".join(companies),
-        grounded_context=grounded_context or "No grounded context was retrieved for this request.",
+        search_context=search_context or "No search results were retrieved for this request.",
     )
